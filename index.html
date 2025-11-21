@@ -81,8 +81,187 @@
   </div>
 
   <script>
-    // HINWEIS: Skript wird später hinzugefügt
-    alert("App geladen – bitte OpenCV.js-Code nachliefern!");
+  // OpenCV.js laden
+  const script = document.createElement('script');
+  script.src = 'https://docs.opencv.org/4.x/opencv.js';
+  document.head.appendChild(script);
+
+  let cvReady = false;
+  script.onload = () => {
+    if (typeof cv !== 'undefined') {
+      cv['onRuntimeInitialized'] = () => {
+        cvReady = true;
+        setStatus('OpenCV bereit.');
+      }
+    }
+  };
+
+  const fileEl = document.getElementById('file');
+  const previewEl = document.getElementById('preview');
+  const outEl = document.getElementById('out');
+  const videoEl = document.getElementById('video');
+  const canvasEl = document.getElementById('canvas');
+  const statusEl = document.getElementById('status');
+
+  const targetR = document.getElementById('targetR');
+  const tolPct = document.getElementById('tolPct');
+  const tolLbl = document.getElementById('tolLbl');
+  const dp = document.getElementById('dp');
+  const minDist = document.getElementById('minDist');
+  const param1 = document.getElementById('param1');
+  const param2 = document.getElementById('param2');
+  const minR = document.getElementById('minR');
+  const maxR = document.getElementById('maxR');
+  const useClahe = document.getElementById('useClahe');
+  const useBlur = document.getElementById('useBlur');
+
+  tolPct.addEventListener('input', () => tolLbl.textContent = tolPct.value);
+
+  function setStatus(msg){ statusEl.textContent = msg; }
+
+  fileEl.addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const url = URL.createObjectURL(file);
+    previewEl.src = url;
+    outEl.src = '';
+  });
+
+  let stream = null;
+  document.getElementById('openCam').onclick = async () => {
+    try{
+      stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}, audio:false});
+      videoEl.srcObject = stream;
+      await videoEl.play();
+      setStatus('Kamera läuft.');
+    }catch(err){ setStatus('Kamera-Fehler: '+err); }
+  };
+  document.getElementById('snap').onclick = () => {
+    if(!videoEl.videoWidth){ setStatus('Keine Kamera aktiv.'); return; }
+    const w = videoEl.videoWidth, h = videoEl.videoHeight;
+    canvasEl.width = w; canvasEl.height = h;
+    const ctx = canvasEl.getContext('2d');
+    ctx.drawImage(videoEl, 0, 0, w, h);
+    previewEl.src = canvasEl.toDataURL('image/jpeg');
+    setStatus('Foto übernommen.');
+  };
+  document.getElementById('stopCam').onclick = () => {
+    if(stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; setStatus('Kamera gestoppt.'); }
+  };
+
+  document.getElementById('countBtn').onclick = async () => {
+    if(!cvReady){ setStatus('OpenCV lädt noch…'); return; }
+    if(!previewEl.src){ setStatus('Bitte ein Bild laden oder Foto aufnehmen.'); return; }
+
+    const img = await loadImage(previewEl.src);
+    const mat = cv.imread(img);
+
+    let src = new cv.Mat();
+    cv.cvtColor(mat, src, cv.COLOR_RGBA2BGR);
+    if(useClahe.checked){ src = applyCLAHE(src); }
+    if(useBlur.checked){
+      let tmp = new cv.Mat();
+      cv.GaussianBlur(src, tmp, new cv.Size(5,5), 0, 0, cv.BORDER_DEFAULT); src.delete(); src=tmp;
+    }
+
+    const dpVal = parseFloat(dp.value);
+    const minDistVal = parseInt(minDist.value,10);
+    const p1 = parseInt(param1.value,10);
+    const p2 = parseInt(param2.value,10);
+
+    let circles = [];
+    const tr = parseInt(targetR.value,10);
+    if(tr>0){
+      circles = detectTarget(src, tr, parseInt(tolPct.value,10), dpVal, minDistVal, p1, p2);
+    } else {
+      circles = detectFlexible(
+        src,
+        new Params(dpVal, Math.max(20,minDistVal||20), p1, p2, parseInt(minR.value,10), parseInt(maxR.value,10))
+      );
+      if(circles.length>0){
+        const medR = median(circles.map(c=>c[2]));
+        circles = detectTarget(src, Math.round(medR), parseInt(tolPct.value,10), dpVal, minDistVal, p1, p2);
+        targetR.value = Math.round(medR);
+      }
+    }
+
+    const annotated = drawCirclesOverlay(mat, circles);
+    outEl.src = annotated.toDataURL('image/png');
+    lastCSV = 'x,y,r\n' + circles.map(c=>`${c[0]},${c[1]},${c[2]}`).join('\n');
+    setStatus(`Anzahl: ${circles.length}`);
+
+    mat.delete(); src.delete(); annotated.remove();
+  };
+
+  let lastCSV = '';
+  document.getElementById('saveCsv').onclick = () => {
+    if(!lastCSV){ setStatus('Bitte zuerst zählen.'); return; }
+    downloadBlob(new Blob([lastCSV], {type:'text/csv'}), 'count_result.csv');
+  };
+  document.getElementById('savePng').onclick = () => {
+    if(!outEl.src){ setStatus('Kein Ergebnisbild.'); return; }
+    fetch(outEl.src).then(r=>r.blob()).then(b=>downloadBlob(b, 'annotated.png'));
+  };
+
+  function downloadBlob(blob, name){
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = name; a.click();
+    setTimeout(()=>URL.revokeObjectURL(a.href), 1000);
+  }
+  function loadImage(src){
+    return new Promise((res, rej)=>{ const i=new Image(); i.onload=()=>res(i); i.onerror=rej; i.src=src; });
+  }
+  function median(arr){ const a=[...arr].sort((x,y)=>x-y); const m=Math.floor(a.length/2); return a.length%2?a[m]:(a[m-1]+a[m])/2; }
+
+  class Params{ constructor(dp,minDist,param1,param2,minR,maxR){ Object.assign(this,{dp,minDist,param1,param2,minR,maxR}); } }
+
+  function applyCLAHE(bgr){
+    const lab = new cv.Mat(); cv.cvtColor(bgr, lab, cv.COLOR_BGR2Lab);
+    const planes = new cv.MatVector(); cv.split(lab, planes);
+    const l = planes.get(0);
+    const clahe = new cv.CLAHE(2.0, new cv.Size(8,8));
+    clahe.apply(l, l); planes.set(0,l);
+    const merged = new cv.Mat(); cv.merge(planes, merged);
+    const out = new cv.Mat(); cv.cvtColor(merged, out, cv.COLOR_Lab2BGR);
+    lab.delete(); merged.delete(); planes.delete(); clahe.delete();
+    bgr.delete();
+    return out;
+  }
+
+  function detectFlexible(bgr, p){
+    const gray = new cv.Mat(); cv.cvtColor(bgr, gray, cv.COLOR_BGR2GRAY); cv.medianBlur(gray, gray, 5);
+    const circles = new cv.Mat();
+    cv.HoughCircles(gray, circles, cv.HOUGH_GRADIENT, p.dp, p.minDist, p.param1, p.param2, p.minR, p.maxR);
+    const out=[]; for(let i=0;i<circles.cols;i++){
+      const v=circles.data32F.slice(i*3,(i+1)*3);
+      out.push([Math.round(v[0]),Math.round(v[1]),Math.round(v[2])]);
+    }
+    gray.delete(); circles.delete(); return out;
+  }
+
+  function detectTarget(bgr, targetR, tolPct, dp, minDist, p1, p2){
+    const tol = Math.max(0, tolPct)/100.0;
+    const rmin=Math.max(1, Math.round(targetR*(1-tol)));
+    const rmax=Math.max(rmin+1, Math.round(targetR*(1+tol)));
+    const useMin = Math.max(1, minDist>0?minDist:Math.round(2*targetR*1.05));
+    return detectFlexible(bgr, new Params(dp, useMin, p1, p2, rmin, rmax));
+  }
+
+  function drawCirclesOverlay(srcRGBA, circles){
+    const c = document.createElement('canvas'); c.width = srcRGBA.cols; c.height = srcRGBA.rows;
+    const ctx=c.getContext('2d');
+    const tmp = new cv.Mat(); cv.cvtColor(srcRGBA, tmp, cv.COLOR_RGBA2RGB);
+    const out = new cv.Mat(); cv.cvtColor(tmp, out, cv.COLOR_RGB2RGBA);
+    const imgData = new ImageData(new Uint8ClampedArray(out.data), out.cols, out.rows);
+    ctx.putImageData(imgData, 0, 0);
+    ctx.strokeStyle = 'lime'; ctx.lineWidth = 2; ctx.fillStyle = 'red';
+    circles.forEach(([x,y,r])=>{
+      ctx.beginPath(); ctx.arc(x,y,r,0,2*Math.PI); ctx.stroke();
+      ctx.beginPath(); ctx.arc(x,y,2,0,2*Math.PI); ctx.fill();
+    });
+    tmp.delete(); out.delete();
+    return c;
+  }
   </script>
 </body>
 </html>
